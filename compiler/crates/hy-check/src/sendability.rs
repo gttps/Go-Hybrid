@@ -388,6 +388,14 @@ impl<'a> Checker<'a> {
                 "as written this also panics in Go — concurrent map writes are a runtime fatal; the checker tells you earlier".to_string(),
             );
         }
+        if !b.immutable
+            && self.non_owned_origin_of(st, name).is_none()
+            && matches!(self.classify_move_ident(st, name), Outcome::Ok)
+        {
+            notes.push(format!(
+                "unlike a fresh literal rvalue, `{name}` is a named local binding so this scope retains access to it after the boundary; pass `move {name}` to transfer ownership and freeze `{name}` (and any aliases) against subsequent use (Tier-0 rule O5)"
+            ));
+        }
         Outcome::Rejected(RejectInfo {
             value: name.to_string(),
             ty,

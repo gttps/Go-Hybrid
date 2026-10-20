@@ -5176,5 +5176,128 @@ mod tests {
             .count();
         assert_eq!(e3006_count, 2, "{:?}", r.diagnostics);
     }
+
+    #[test]
+    fn issue_924_unmoved_local_map_at_spawn_emits_move_hint_and_guards_e3001_e3003() {
+        // 1. Owned local map/slice at spawn rejects with HYB-E3001 and emits the `move m` note.
+        let unmoved_local = check(
+            "fn bump(m map[string]int, done chan<- bool) {\n\
+               m[\"i\"] = 1\n\
+               done <- true\n\
+             }\n\
+             fn main() {\n\
+               m := map[string]int{}\n\
+               done := make(chan bool, 1)\n\
+               task bump(m, done)\n\
+               m[\"j\"] = 1\n\
+               <-done\n\
+             }",
+        );
+        assert_eq!(
+            unmoved_local.verdict,
+            Verdict::Reject,
+            "{:?}",
+            unmoved_local.diagnostics
+        );
+        assert_eq!(unmoved_local.diagnostics[0].code, "HYB-E3001");
+        assert_eq!(first_error_rule(&unmoved_local).as_deref(), Some("A1c"));
+        assert!(
+            unmoved_local.diagnostics[0]
+                .notes
+                .iter()
+                .any(|n| n.contains("move m") && n.contains("Tier-0 rule O5")),
+            "expected `move m` note on owned local binding rejection, got {:?}",
+            unmoved_local.diagnostics[0].notes
+        );
+
+        let unmoved_slice = check(
+            "fn bump_slice(s []int, done chan<- bool) {\n\
+               s[0] = 1\n\
+               done <- true\n\
+             }\n\
+             fn main() {\n\
+               s := []int{0}\n\
+               done := make(chan bool, 1)\n\
+               task bump_slice(s, done)\n\
+               <-done\n\
+             }",
+        );
+        assert_eq!(unmoved_slice.verdict, Verdict::Reject);
+        assert_eq!(unmoved_slice.diagnostics[0].code, "HYB-E3001");
+        assert!(
+            unmoved_slice.diagnostics[0]
+                .notes
+                .iter()
+                .any(|n| n.contains("move s") && n.contains("Tier-0 rule O5")),
+            "expected `move s` note on owned local slice rejection, got {:?}",
+            unmoved_slice.diagnostics[0].notes
+        );
+
+        // 2. Non-owned binding (function parameter) rejects with HYB-E3001 and does NOT emit the `move m` note.
+        let non_owned_param = check(
+            "fn bump(m map[string]int, done chan<- bool) {\n\
+               m[\"i\"] = 1\n\
+               done <- true\n\
+             }\n\
+             fn relay(m map[string]int) {\n\
+               done := make(chan bool, 1)\n\
+               task bump(m, done)\n\
+               <-done\n\
+             }",
+        );
+        assert_eq!(non_owned_param.verdict, Verdict::Reject);
+        assert_eq!(non_owned_param.diagnostics[0].code, "HYB-E3001");
+        assert!(
+            !non_owned_param.diagnostics[0]
+                .notes
+                .iter()
+                .any(|n| n.contains("move m")),
+            "parameter `m` is not movable (HYB-E3004), so `move m` note must not be emitted: {:?}",
+            non_owned_param.diagnostics[0].notes
+        );
+
+        // 3. Explicit `move m` accepts when unused afterward, and rejects post-spawn write with HYB-E3003.
+        let moved_clean = check(
+            "fn bump(m map[string]int, done chan<- bool) {\n\
+               m[\"i\"] = 1\n\
+               done <- true\n\
+             }\n\
+             fn main() {\n\
+               m := map[string]int{}\n\
+               done := make(chan bool, 1)\n\
+               task bump(move m, done)\n\
+               <-done\n\
+             }",
+        );
+        assert_eq!(
+            moved_clean.verdict,
+            Verdict::Accept,
+            "{:?}",
+            moved_clean.diagnostics
+        );
+        assert!(moved_clean.diagnostics.is_empty());
+
+        let moved_then_write = check(
+            "fn bump(m map[string]int, done chan<- bool) {\n\
+               m[\"i\"] = 1\n\
+               done <- true\n\
+             }\n\
+             fn main() {\n\
+               m := map[string]int{}\n\
+               done := make(chan bool, 1)\n\
+               task bump(move m, done)\n\
+               m[\"j\"] = 1\n\
+               <-done\n\
+             }",
+        );
+        assert_eq!(
+            moved_then_write.verdict,
+            Verdict::Reject,
+            "{:?}",
+            moved_then_write.diagnostics
+        );
+        assert_eq!(moved_then_write.diagnostics[0].code, "HYB-E3003");
+        assert_eq!(first_error_rule(&moved_then_write).as_deref(), Some("A1b"));
+    }
 }
 
