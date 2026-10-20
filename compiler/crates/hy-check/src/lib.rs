@@ -5298,6 +5298,46 @@ mod tests {
         );
         assert_eq!(moved_then_write.diagnostics[0].code, "HYB-E3003");
         assert_eq!(first_error_rule(&moved_then_write).as_deref(), Some("A1b"));
+
+        // 4. Channel send boundary: `ch <- m` emits HYB-E3002 with `move m` hint; `ch <- move m` accepts cleanly.
+        let send_unmoved = check(
+            "fn main() {\n\
+               m := map[string]int{}\n\
+               ch := make(chan map[string]int, 1)\n\
+               ch <- m\n\
+             }",
+        );
+        assert_eq!(
+            send_unmoved.verdict,
+            Verdict::Reject,
+            "{:?}",
+            send_unmoved.diagnostics
+        );
+        assert_eq!(send_unmoved.diagnostics[0].code, "HYB-E3002");
+        assert_eq!(first_error_rule(&send_unmoved).as_deref(), Some("A1c"));
+        assert!(
+            send_unmoved.diagnostics[0]
+                .notes
+                .iter()
+                .any(|n| n.contains("move m") && n.contains("Tier-0 rule O5")),
+            "expected `move m` note on channel send rejection, got {:?}",
+            send_unmoved.diagnostics[0].notes
+        );
+
+        let send_moved = check(
+            "fn main() {\n\
+               m := map[string]int{}\n\
+               ch := make(chan map[string]int, 1)\n\
+               ch <- move m\n\
+             }",
+        );
+        assert_eq!(
+            send_moved.verdict,
+            Verdict::Accept,
+            "{:?}",
+            send_moved.diagnostics
+        );
+        assert!(send_moved.diagnostics.is_empty());
     }
 }
 
