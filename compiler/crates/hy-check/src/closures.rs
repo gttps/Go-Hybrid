@@ -1218,14 +1218,101 @@ fn check_stmt_boundaries<'a>(ck: &mut Checker<'_>, st: &mut FnState, stmt: &'a S
     }
 }
 
+fn closure_slot_path_root(path: &str) -> &str {
+    path.split('.').next().unwrap_or(path)
+}
+
+fn closure_slot_paths_conflict(st: &FnState, loan_path: &str, event_path: &str) -> bool {
+    let lr = closure_slot_path_root(loan_path);
+    let er = closure_slot_path_root(event_path);
+    if lr == er {
+        return true;
+    }
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    seen.insert(lr.to_string());
+    let mut stack = vec![lr.to_string()];
+    while let Some(x) = stack.pop() {
+        if x == er {
+            return true;
+        }
+        if let Some(p) = st.aliases.get(&x) {
+            if seen.insert(p.clone()) {
+                stack.push(p.clone());
+            }
+        }
+        for (k, v) in &st.aliases {
+            if v == &x && seen.insert(k.clone()) {
+                stack.push(k.clone());
+            }
+        }
+        if let Some(peers) = st.may_share.get(&x) {
+            for p in peers {
+                if seen.insert(p.clone()) {
+                    stack.push(p.clone());
+                }
+            }
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_closure_o8_alias_if_live(
+    ck: &mut Checker<'_>,
+    st: &FnState,
+    path: &str,
+    key: Option<&str>,
+    owner: Option<&str>,
+    span: hy_diag::Span,
+    idx: usize,
+    what: &str,
+) {
+    use crate::model::LoanTarget;
+    let Some(loan) = st.loans.iter().find(|l| {
+        let eff_last = ck.effective_loan_last(st, l);
+        matches!(&l.target, LoanTarget::MapSlot { binding, path: p, key: k }
+            if owner != Some(binding.as_str())
+                && closure_slot_paths_conflict(st, p, path)
+                && !matches!((k.as_deref(), key), (Some(a), Some(b)) if a != b))
+            && l.created <= idx
+            && idx <= eff_last
+    }) else {
+        return;
+    };
+    let eff_last = ck.effective_loan_last(st, loan);
+    let LoanTarget::MapSlot { binding, .. } = &loan.target else {
+        unreachable!("filtered above");
+    };
+    let msg = format!(
+        "{} on `{}` aliases the live slot loan `{}`",
+        what, path, binding
+    );
+    let notes = vec![
+        format!(
+            "{} ({}:{}) is a unique loan on a slot of `{}`, live from creation to its last use (O8, non-lexical window ending at statement {})",
+            loan.desc, ck.path, loan.span.start, path, eff_last
+        ),
+        format!(
+            "the loan lowers to copy-out / store-back, so this access and `{}` would silently overwrite each other — finish using `{}` first, or mutate the slot only through `{}`",
+            binding, binding, binding
+        ),
+    ];
+    ck.diags.push(
+        hy_diag::Diagnostic::error("HYB-E3102", ck.path.clone(), span, msg).with_notes(notes),
+    );
+}
+
 /// Check A3 (`HYB-E3102`) for map-slot loans opened inside a closure body.
-fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block) {
+fn check_closure_slot_loans(ck: &mut Checker<'_>, outer_st: &mut FnState, body: &Block) {
     use crate::model::{Loan, LoanTarget};
     use crate::walk;
     let flat = walk::flatten(body);
-    let saved_last_use = std::mem::replace(&mut st.last_use, flat.last_use.clone());
-    let saved_loop_end = std::mem::replace(&mut st.loop_end, flat.loop_end.clone());
-    let saved_loans = std::mem::take(&mut st.loans);
+    let mut slot_st = outer_st.clone();
+    let st = &mut slot_st;
+    st.last_use = flat.last_use.clone();
+    st.loop_end = flat.loop_end.clone();
+    st.loans.clear();
+    st.scope_push();
     for (stmt, idx) in &flat.stmts {
         let idx = *idx;
         let mut calls = Vec::new();
@@ -1241,6 +1328,16 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
                         if let Some(path) = walk::addr_of_index_base_path(val) {
                             let binding = name.clone();
                             let key = walk::addr_of_index_slot_key(val);
+                            emit_closure_o8_alias_if_live(
+                                ck,
+                                st,
+                                &path,
+                                key.as_deref(),
+                                Some(&binding),
+                                val.span(),
+                                idx,
+                                "a second slot loan",
+                            );
                             let last = st.last_use.get(&binding).copied().unwrap_or(idx).max(idx);
                             st.loans.push(Loan {
                                 target: LoanTarget::MapSlot {
@@ -1255,6 +1352,15 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
                             });
                         } else {
                             ck.extend_map_slot_loan_to_alias(st, name, val, idx);
+                            let shape = match (&l.ty, ck.shape_of_expr(st, val)) {
+                                (Some(t), TypeShape::Unknown) => ck.shape_of_type(t),
+                                (_, s) => s,
+                            };
+                            ck.define_binding(st, name, shape, l.ty.clone(), false, false, false);
+                            ck.record_may_share(st, name, val);
+                            ck.record_alias(st, name, val);
+                            ck.record_move_const_and_a3_loans(st, name, val, idx);
+                            ck.record_closure_mutations(st, name, val);
                         }
                     }
                 } else if l.values.len() == 1 && l.names.len() == 2 {
@@ -1262,6 +1368,16 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
                     if let Some(path) = walk::addr_of_index_base_path(val) {
                         let binding = l.names[0].clone();
                         let key = walk::addr_of_index_slot_key(val);
+                        emit_closure_o8_alias_if_live(
+                            ck,
+                            st,
+                            &path,
+                            key.as_deref(),
+                            Some(&binding),
+                            val.span(),
+                            idx,
+                            "a second slot loan",
+                        );
                         let last = st.last_use.get(&binding).copied().unwrap_or(idx).max(idx);
                         st.loans.push(Loan {
                             target: LoanTarget::MapSlot {
@@ -1274,6 +1390,21 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
                             span: val.span(),
                             desc: format!("`{} := {}`", l.names.join(", "), val.render()),
                         });
+                    }
+                } else if l.values.is_empty() {
+                    if let Some(t) = &l.ty {
+                        let shape = ck.shape_of_type(t);
+                        for name in &l.names {
+                            ck.define_binding(
+                                st,
+                                name,
+                                shape.clone(),
+                                Some(t.clone()),
+                                false,
+                                false,
+                                false,
+                            );
+                        }
                     }
                 }
             }
@@ -1289,6 +1420,16 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
                             if let Some(path) = walk::addr_of_index_base_path(v) {
                                 let binding = name.clone();
                                 let key = walk::addr_of_index_slot_key(v);
+                                emit_closure_o8_alias_if_live(
+                                    ck,
+                                    st,
+                                    &path,
+                                    key.as_deref(),
+                                    Some(&binding),
+                                    v.span(),
+                                    idx,
+                                    "a second slot loan",
+                                );
                                 let last =
                                     st.last_use.get(&binding).copied().unwrap_or(idx).max(idx);
                                 st.loans.push(Loan {
@@ -1316,6 +1457,16 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
                         if let Some(path) = walk::addr_of_index_base_path(v) {
                             let binding = name.clone();
                             let key = walk::addr_of_index_slot_key(v);
+                            emit_closure_o8_alias_if_live(
+                                ck,
+                                st,
+                                &path,
+                                key.as_deref(),
+                                Some(&binding),
+                                v.span(),
+                                idx,
+                                "a second slot loan",
+                            );
                             let last = st.last_use.get(&binding).copied().unwrap_or(idx).max(idx);
                             st.loans.push(Loan {
                                 target: LoanTarget::MapSlot {
@@ -1336,6 +1487,17 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
                         if let Some(path) = walk::place_path(t) {
                             ck.emit_a3_if_live_pub(st, &path, t.span, idx, "insert");
                         }
+                    } else if let Some((path, key)) = walk::place_field_store_slot(t) {
+                        emit_closure_o8_alias_if_live(
+                            ck,
+                            st,
+                            &path,
+                            key.as_deref(),
+                            None,
+                            t.span,
+                            idx,
+                            "a field store",
+                        );
                     } else if *op == hy_syntax::AssignOp::Assign {
                         if let hy_syntax::PlaceKind::Ident(name) = &t.kind {
                             ck.emit_a3_if_live_pub(st, name, t.span, idx, "rebind");
@@ -1344,13 +1506,35 @@ fn check_closure_slot_loans(ck: &mut Checker<'_>, st: &mut FnState, body: &Block
                         }
                     }
                 }
+                if *op == hy_syntax::AssignOp::Assign && targets.len() == values.len() {
+                    for (t, v) in targets.iter().zip(values.iter()) {
+                        if let hy_syntax::PlaceKind::Ident(name) = &t.kind {
+                            if walk::addr_of_index_base_path(v).is_none() {
+                                if !ck.value_reads_storage_of(st, v, name) {
+                                    st.aliases.remove(name);
+                                    st.share_clear(name);
+                                }
+                                ck.record_may_share(st, name, v);
+                                ck.record_alias(st, name, v);
+                                ck.record_move_const_and_a3_loans(st, name, v, idx);
+                                ck.record_closure_mutations(st, name, v);
+                            }
+                        }
+                    }
+                }
             }
             _ => {}
         }
     }
-    st.loans = saved_loans;
-    st.loop_end = saved_loop_end;
-    st.last_use = saved_last_use;
+    for (k, b) in &slot_st.env {
+        if b.moved.is_some() {
+            if let Some(ob) = outer_st.env.get_mut(k) {
+                if ob.moved.is_none() {
+                    ob.moved = b.moved.clone();
+                }
+            }
+        }
+    }
 }
 
 /// The outermost FnLits reachable from `block`. Closures nested inside other
