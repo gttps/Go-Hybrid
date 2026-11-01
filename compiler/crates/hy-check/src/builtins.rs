@@ -10,9 +10,12 @@
 //! variable operands stay a run-time concern, matching Go.
 
 use crate::const_overflow::{const_int_fold_with, ConstFold};
-use crate::model::{unwrap_parens, Checker, FnState};
+use crate::model::{unwrap_parens, Checker, FnState, TypeShape};
 use hy_diag::{Diagnostic, Span};
-use hy_syntax::{ChanDir, Expr, ForKind, LitKind, Place, PlaceKind, SelectArmKind, Stmt, UnOp};
+use hy_syntax::{
+    AssignOp, ChanDir, Expr, ForKind, LitKind, LocalKind, Place, PlaceKind, SelectArmKind, Stmt,
+    UnOp,
+};
 use std::collections::HashMap;
 
 impl<'a> Checker<'a> {
@@ -26,7 +29,8 @@ impl<'a> Checker<'a> {
         for sc in &st.scopes {
             self.zd_defined.extend(sc.keys().cloned());
         }
-        self.check_stmt_builtin_args_inner(st, stmt, /*deep=*/ false);
+        let mut cst = st.clone();
+        self.check_stmt_builtin_args_inner(&mut cst, stmt, /*deep=*/ false);
         self.zd_defined.clear();
     }
 
@@ -56,21 +60,44 @@ impl<'a> Checker<'a> {
         );
     }
 
-    fn check_stmt_builtin_args_inner(&mut self, st: &FnState, stmt: &Stmt, deep: bool) {
+    fn check_stmt_builtin_args_inner(&mut self, st: &mut FnState, stmt: &Stmt, deep: bool) {
         match stmt {
             Stmt::Local(l) => {
                 for v in &l.values {
                     self.check_expr_builtin_args(st, v);
                 }
+                if deep {
+                    let (imm, is_let, pre) = (l.kind == LocalKind::Const, l.kind == LocalKind::Let, st.clone());
+                    for (i, n) in l.names.iter().enumerate() {
+                        let v = l.values.get(i);
+                        let s = v.map(|e| self.shape_of_expr(&pre, e)).filter(|s| !matches!(s, TypeShape::Unknown))
+                            .or_else(|| l.ty.as_ref().map(|t| self.shape_of_type(t))).unwrap_or(TypeShape::Unknown);
+                        self.define_binding(st, n, s, v.and_then(|e| self.ty_of_expr(&pre, e)).or_else(|| l.ty.clone()), imm, false, is_let);
+                        if let Some(e) = v { Self::track_deep_rhs(st, n, e); }
+                    }
+                }
             }
             Stmt::Assign {
-                targets, values, ..
+                targets, op, values, ..
             } => {
                 for t in targets {
                     self.check_place_builtin_args(st, t);
                 }
                 for v in values {
                     self.check_expr_builtin_args(st, v);
+                }
+                if deep && matches!(op, AssignOp::Assign) && targets.len() == values.len() {
+                    let pre = st.clone();
+                    for (t, v) in targets.iter().zip(values) {
+                        if let PlaceKind::Ident(n) = &t.kind {
+                            let (s, ty) = (self.shape_of_expr(&pre, v), self.ty_of_expr(&pre, v));
+                            if let Some(b) = st.env_lookup_mut(n) {
+                                if !matches!(s, TypeShape::Unknown) { b.shape = s; }
+                                if ty.is_some() || b.ty.is_none() { b.ty = ty; }
+                            }
+                            Self::track_deep_rhs(st, n, v);
+                        }
+                    }
                 }
             }
             Stmt::Expr { expr, .. } => self.check_expr_builtin_args(st, expr),
@@ -197,10 +224,12 @@ impl<'a> Checker<'a> {
         match expr {
             Expr::Call { callee, args, span } => {
                 self.check_expr_builtin_args(st, callee);
+                let unshadowed = |s: &Self, n: &str| {
+                    !s.fns.contains_key(n) && s.lookup_binding(st, n).is_none() && !s.zd_defined.contains(n) && !s.closure_bound.iter().any(|c| c.contains(n))
+                };
                 let is_type_arg_builtin = matches!(
                     unwrap_parens(callee),
-                    Expr::Ident { name, .. }
-                        if (name == "make" || name == "new") && !self.fns.contains_key(name.as_str())
+                    Expr::Ident { name, .. } if (name == "make" || name == "new") && unshadowed(self, name)
                 );
                 for (i, a) in args.iter().enumerate() {
                     if is_type_arg_builtin && i == 0 {
@@ -209,7 +238,9 @@ impl<'a> Checker<'a> {
                     self.check_expr_builtin_args(st, &a.value);
                 }
                 if let Expr::Ident { name, .. } = unwrap_parens(callee) {
-                    self.check_builtin_call(name, args, *span);
+                    if unshadowed(self, name) {
+                        self.check_builtin_call(name, args, *span);
+                    }
                 }
                 // W-016 M3: a closure that writes a captured binding and is
                 // passed to a foreign Go call is the A5 escape perimeter
@@ -272,10 +303,16 @@ impl<'a> Checker<'a> {
                     }
                 }
             }
-            Expr::FnLit { params, body, .. } => {
+            Expr::FnLit { params, results, body, .. } => {
                 self.push_closure_bound(params, body);
+                let mut cst = st.clone();
+                for (n, ty) in params.iter().map(|p| (&p.name, &p.ty)).chain(
+                    results.iter().filter_map(|r| r.name.as_ref().filter(|n| *n != "_").map(|n| (n, &r.ty))),
+                ) {
+                    self.define_binding(&mut cst, n, self.shape_of_type(ty), Some(ty.clone()), false, false, false);
+                }
                 for stmt in &body.stmts {
-                    self.check_stmt_builtin_args_inner(st, stmt, /*deep=*/ true);
+                    self.check_stmt_builtin_args_inner(&mut cst, stmt, /*deep=*/ true);
                 }
                 self.pop_closure_bound();
             }
@@ -717,7 +754,7 @@ impl<'a> Checker<'a> {
     }
 
     fn arg_closure_captured_write(&self, st: &FnState, arg: &Expr) -> Option<String> {
-        match unwrap_parens(arg) {
+        match unwrap_parens_and_move(arg) {
             Expr::FnLit {
                 params,
                 results,
@@ -767,22 +804,20 @@ impl<'a> Checker<'a> {
         let mut scopes = vec![init];
 
         let classify = |val: Option<&Expr>, sc: &ScopeMap| -> Option<(String, bool)> {
-            let e = unwrap_parens(val?);
+            let e = unwrap_parens_and_move(val?);
             let (inner, is_addr) = match crate::model::as_addr_of(e) {
-                Some(op) => (unwrap_parens(op), true),
+                Some(op) => (unwrap_parens_and_move(op), true),
                 None => (e, false),
             };
             let r = inner.root_ident()?;
             if r == "_" {
                 return None;
             }
+            let is_ptr = is_addr || matches!(self.shape_of_expr(st, e), TypeShape::Pointer(_));
             if let Some(entry) = sc.get(r) {
                 let (cap, was_ptr) = entry.as_ref()?;
-                return Some((cap.clone(), is_addr || *was_ptr));
+                return Some((cap.clone(), is_ptr || *was_ptr));
             }
-            let is_ptr = is_addr
-                || matches!(e, Expr::Ident { .. })
-                    && matches!(self.shape_of_expr(st, e), crate::model::TypeShape::Pointer(_));
             Some((r.to_string(), is_ptr))
         };
 
@@ -855,7 +890,7 @@ impl<'a> Checker<'a> {
                                 }
                             }
                             PlaceKind::Field { .. } | PlaceKind::AddrOf { .. } => {
-                                if let Some((c, true)) = alias {
+                                if let Some((c, _)) = alias.filter(|(_, p)| *p || place_has_index(t)) {
                                     return Some(c);
                                 }
                             }
@@ -942,6 +977,32 @@ impl<'a> Checker<'a> {
             _ => {}
         }
         None
+    }
+    fn track_deep_rhs(st: &mut FnState, name: &str, val: &Expr) {
+        st.aliases.remove(name);
+        st.closure_defs.remove(name);
+        match unwrap_parens_and_move(val) {
+            Expr::Ident { name: src, .. } if src != name => { st.aliases.insert(name.to_string(), src.clone()); }
+            Expr::FnLit { params, results, body, .. } => {
+                st.closure_defs.insert(name.to_string(), (params.clone(), results.clone(), body.clone()));
+            }
+            _ => {}
+        }
+    }
+}
+
+fn unwrap_parens_and_move(mut e: &Expr) -> &Expr {
+    while let Expr::Paren { inner, .. } | Expr::Move { operand: inner, .. } = e {
+        e = inner;
+    }
+    e
+}
+
+fn place_has_index(place: &Place) -> bool {
+    match &place.kind {
+        PlaceKind::Index { .. } => true,
+        PlaceKind::Field { base, .. } | PlaceKind::AddrOf { base } => place_has_index(base),
+        PlaceKind::Ident(_) => false,
     }
 }
 
